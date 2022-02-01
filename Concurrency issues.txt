@@ -1,0 +1,362 @@
+==============================================================================================================================================================================
+# 1.
+----------------------------------------------------------
+struct Account {
+    unsigned id;
+    unsigned balance;
+    mutex mtx;
+};
+
+bool transfer(Account& from, Account& to, unsigned amount)
+{
+    unique_lock lck1(from.mtx);
+    unique_lock lck2(to.mtx);
+    if(from.balance < amount) return false;
+    from.balance -= amount;
+    to.balance += amount;
+}
+----------------------------------------------------------
+There's a potential deadlock. If 2 instances of transfer() run concurrently between the same accounts, but in reverse order
+(ex: transfer(a1,a2,amount1) and transfer(a2,a1,amount2)), it's possible that the 1st locks the mutex of a1 and the second locks the
+mutex of a2. Then the 1st transfer waits for a2, and the second for a1 to become available.
+
+A solution is to always lock the mutexes in increasing order of the account IDs:
+----------------------------------------------------------
+bool transferAssumingLocked(Account& from, Account& to, unsigned amount)
+{
+    if(from.balance < amount) return false;
+    from.balance -= amount;
+    to.balance += amount;
+}
+bool transfer(Account& from, Account& to, unsigned amount)
+{
+    if(from.id < to.id) {
+        unique_lock lck1(from.mtx);
+        unique_lock lck2(to.mtx);
+        return transferAssumingLocked(from, to, amount);
+    }
+    if(from.id > to.id) {
+        unique_lock lck2(to.mtx);
+        unique_lock lck1(from.mtx);
+        return transferAssumingLocked(from, to, amount);
+    }
+    return true; 	// transfer from an account to itself
+}
+----------------------------------------------------------
+
+
+
+
+==============================================================================================================================================================================
+# 2.
+Consider the following code for enqueueing a continuation on a future (the set() function is guaranteed to be called exactly once by the user code).
+----------------------------------------------------------
+1  template<typename T>
+2  class Future {
+3  	list<function<void(T)> > continuations;
+4  	T val;
+5  	bool hasValue;
+6  	mutex mtx;
+7  public:
+8  	Future() :hasValue(false) {}
+9  	void set(T v) {
+10 		val = v;
+11 		hasValue = true;
+12 		unique_lock<mutex> lck(mtx);
+13 		for(function<void(T)>& f : continuations) {
+14 			f(v);
+15 		}
+16 		continuations.clear();
+17 	}
+18 	void addContinuation(function<void(T)> f) {
+19 		if(hasValue) {
+20 			f(val);
+21 		} else {
+  // 9  	                                     void set(T v)   // IMPOSTOR, executed once  => f(val) never executed                     
+22 			unique_lock<mutex> lck(mtx);
+23 			continuations.push_back(f);
+24 		}
+25 	}
+26 };
+----------------------------------------------------------
+- simultaneous calls to addContinuation() and set() may lead to continuations that are never executed
+- to solve all concurrency issues, one has to move both the content of line 12 to between lines 9 and 10 and the content of line 22 to between lines 18 and 19
+
+addContinuation() either executes the continuation or adds it to the continuations list, and the continuation list is executed only once (bc set() is executed only once) => 
+		  no continuation can be executed twice.
+Setting/checking of 'hasValue' has to be atomic with the corresponding operation on the 'continuations' vector => lock the mutex BEFORE setting/checking 'hasValue'.
+That is because without this, race conditions are possible involving this variable: 
+	addCondition() sees it as false, but set() executes the enqueued operations before addCondition() adds the one given to it to the queue => that operation is never executed.
+
+
+
+
+==============================================================================================================================================================================
+# 3.
+Consider the following code for computing the scalar product of two vectors.
+----------------------------------------------------------
+1  int scalarProduct(vector<int> const& a,
+2                    vector<int> const& b,
+3  	                     int nrThreads)
+4  {
+5  	int result = 0;
+6  	vector<thread> threads;
+7  	threads.reserve(nrThreads);
+8  	int begin = 0;
+9  	for(int i=0 ; i<nrThreads ; ++i) {
+10 		int end = begin + a.size()/nrThreads;
+11 		threads.emplace_back([&a, &b, begin, end, &result]() {
+12 			int part = 0;
+13 			for(int i=begin ; i<end ; ++i) {
+14 				part += a[i]*b[i];
+15 			result += part;
+16 		});
+17 		begin = end;
+18 	}
+19 	for(int i=0 ; i<nrThreads ; ++i) {
+20 		result += threads[i].get();
+21 	}
+22 	return result;
+23 }
+----------------------------------------------------------
+- some of the terms are not added into the final sum (the last a.size() % nrThreads elements are never processed)
+	- to solve this, one could replace line 10 with: 
+													int end = begin + (a.size()-begin)/(nrThreads-i);  // OR
+													int end = (i+1)*a.size()/nrThreads;
+- there are some concurrency issues requiring the use of mutexes or atomic variables
+  ('result' is used in read-compute-write operations in line 15 by all threads => it has to be atomic or protected by a mutex)
+
+
+
+
+==============================================================================================================================================================================
+# 4.
+Consider the following code for inserting a new value into a linked list at a given position. 
+We assume that insertions can be called concurrently, but not for the same position.
+----------------------------------------------------------
+struct Node {
+    unsigned payload;
+    Node* next;
+    Node* prev;
+    mutex mtx;
+};
+
+void insertAfter(Node* before, unsigned value) {
+    Node* node = new Node;
+    node->payload = value;
+
+    Node* after = before->next;
+
+    before->mtx.lock();
+    before->next = node;
+    before->mtx.unlock();
+
+    after->mtx.lock();
+    after->prev = node;
+    after->mtx.unlock();
+
+    node->prev = before;
+    node->next = after;
+}
+----------------------------------------------------------
+Problem: if the list is A -> B, the following race condition is possible:
+insert(A,x)         
+after=B          insert(x,y)
+A.next=x         ...
+B.prev=x         x.next=y
+x.prev=A         ...
+x.next=B  // !                   => the result after the 2 inserts is A -> x -> B
+
+Solution: lock the before and after nodes simultaneously.
+----------------------------------------------------------
+void insertAfter(Node* before, unsigned value) {
+    Node* node = new Node;
+    node->payload = value;
+    Node* after = before->next;
+    before->mtx.lock();             //
+    after->mtx.lock();
+    before->next = node;
+    after->prev = node;
+    before->mtx.unlock();           //
+    after->mtx.unlock();            
+    node->prev = before;
+    node->next = after;
+}
+----------------------------------------------------------
+
+
+
+
+==============================================================================================================================================================================
+# 5.
+We have n servers that can communicate to each other. There are events producing on each of them; 
+each event has an associated information. Each server must write a history of all events (server and event info) 
+produced on all servers, and, furthermore, the recorded history must be the same for all servers.
+
+Solution:
+Let's consider the case when n = 2. Let's name the processes A and B.
+Every process will keep a Lamport clock, and will pass it in each message.
+Suppose an event occurs in the process A. Then, process A will increment it's timestamp t by one, 
+and send that event alongside t at the process B - this is called: PREPARE event. 
+Process B computes the maximum between its internal clock and the timestamp of the message, then adds one. 
+It sends back an OK with that computed timestamp. Process A receives the OK and sends back a COMMIT message. 
+They have both agreed on this value.
+
+The generalization to n > 2 follows easily.
+Each process having an occuring event will:
+- broadcast PREPARE with the timestamp
+- wait for OKs from all the other processes
+- compute the maximum among the OKs timestamps 
+- broadcast COMMIT to each process
+
+There is only one problem: a process may had previously given an OK but did not get any COMMIT yet for that event. 
+So, in case another COMMIT appears, it can't write that to a file because the COMMIT from the previously sent OK may be either before, or after the current COMMIT. 
+That's why, each process will maintain a list of given OKs as well as a list of COMMITs to be flushed to disk.
+
+
+
+
+==============================================================================================================================================================================
+# 6.
+Consider the following code for transferring money from one account to another.
+----------------------------------------------------------
+struct Account {
+    unsigned id;
+    unsigned balance;
+    mutex mtx;
+};
+
+bool transfer(Account& from, Account& to, unsigned amount) {
+  {
+    unique_lock<mutex> lck1(from.mtx);
+    if(from.balance < amount) return false
+    from.balance -= amount;
+  }
+  {
+    unique_lock<mutex> lck2(to.mtx);
+    to.balance += amount;
+  }
+}
+----------------------------------------------------------
+There is a problem with this method if we want to compute the total sum, 
+because it's possible that the amount is taken out of an account, 
+but not yet added to the other one. Therefore, some amount is lost from the entire sum.
+
+Solution: lock the 2 accounts simultaneously.
+----------------------------------------------------------
+bool transferAssumingLocked(Account& from, Account& to, unsigned amount)
+{
+    if(from.balance < amount) return false;
+    from.balance -= amount;
+    to.balance += amount;
+}
+bool transfer(Account& from, Account& to, unsigned amount)
+{
+    if(from.id < to.id) {
+        unique_lock lck1(from.mtx);
+        unique_lock lck2(to.mtx);
+        return transferAssumingLocked(from, to, amount);
+    }
+    if(from.id > to.id) {
+        unique_lock lck2(to.mtx);
+        unique_lock lck1(from.mtx);
+        return transferAssumingLocked(from, to, amount);
+    }
+    return true; 	// transfer from an account to itself
+}
+
+int getTotalSum(vector<Account> v) {
+  int sum = 0;
+  for(auto account : v) {
+    account.mtx.lock();
+    sum += account.balance;
+  }
+  for(auto account : v)
+    account.mtx.unlock();
+  return sum;
+}
+----------------------------------------------------------
+
+
+
+
+==============================================================================================================================================================================
+# 7.
+Consider the following code for enqueueing a continuation on a future.
+----------------------------------------------------------
+template<typename T>
+class Future {
+  list<function<void(T)>> continuations;
+  T val;
+  bool has_value;
+						 // Solution:  mutex mtx;
+public:
+  Future(): has_value(false) {}
+  void set(T v) {
+                                                 // unique_lock<mutex> lck(mtx);
+    val = v;
+    hasValue = true;
+
+    for(function<void(T)>& f: continuations) {
+      f(v);
+    }
+
+    continuations.clear();
+  }
+  void addContinuation(function<void(T)> f) {
+                                                 // unique_lock<mutex> lck(mtx);
+    if(hasValue) {
+      f(val);
+    } else {
+      continuations.push_back(f);
+    }
+  }
+}
+----------------------------------------------------------
+There is no synchronization mechanism on the hasValue, continuations variables, which are crucial to the algorithm.
+Solution: add mutex for set() and addContinuation() methods, so that only one method can be executed at a time.
+
+
+
+
+==============================================================================================================================================================================
+# 8.
+Consider the following code for enqueueing a work item to a thread pool.
+----------------------------------------------------------
+class ThreadPool {
+  condition_variable cv;
+  mutex mtx;
+  list<function<void()>> work;
+  vector <thread> threads;
+
+  void run() {
+    while(true) {
+      if(work.empty()) {
+        unique_lock<mutex> lck(mtx);
+        cv.wait(lck);
+      } else {
+						//  unique_lock<mutex> lck(mtx);  // Solution
+        function<void()> wi = work.front();
+        work.pop_front();
+        wi();
+      }
+    }
+  }
+public:
+  explicit ThreadPool(int n) {
+    threads.resize(n);
+    for(int i = 0; i < n; ++ i) {
+      threads.emplace_back([this](){run();});
+    }
+  }
+  void enqueue(function <void()> f) {
+    unique_lock<mutex> lck(mtx);
+    work.push_back(f);
+    cv.notify_one();
+  }
+}
+----------------------------------------------------------
+- the 'work' list is a critical shared resource that's not protected by a mutex in the else branch of the run() method
+
+
+
