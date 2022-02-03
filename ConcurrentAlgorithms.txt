@@ -1,0 +1,388 @@
+int[] metadata = new int[]{start, stop, n};
+MPI.COMM_WORLD.Send(metadata, 0, 3, MPI.INT, i, 0);
+MPI.COMM_WORLD.Recv(metadata, 0, 3, MPI.INT, 0, 0);
+public AtomicInteger cnt = new AtomicInteger(0);         // .getAndIncrement()
+public ExecutorService executorService = Executors.newFixedThreadPool(5);
+executorService.submit(()->{ });
+private final ReentrantLock lock = new ReentrantLock();
+Object[] receivedData = new Object[1];
+
+Binary tree calculus boilerplate:
+---------------------------------
+static int func(int me, int nrProcs, ...){
+    // stop condition
+    int child = me + nrProcs/2;
+    if(nrProcs >= 2 && child < nrProcs){
+        // send data to worker   (with nrProcs-nrProcs/2)
+        res1 = func(me, nrProcs/2, 2nd half, ...)    // master job
+        // recv data from worker
+        res2 = data from worker
+    }
+    else{
+        res1 = func(me, 1, 1st half, ...)
+        res2 = func(me, 1, 2nd half, ...)
+    }
+    return res1 + res2;
+}
+
+
+
+####################################################################
+Permutations - split the 1 to n range => start generating for each i
+####################################################################
+
+private static void master(int n, int nrProcs)
+----------------------------------------------
+- step = n/nrProcs , rem = n%nrProcs
+- stopMaster = step , if rem>0 then stopMaster++, rem--
+- start = stopMaster
+- set List<List<Integer>> solutions = new ArrayList<>()
+- for each worker:
+    - stop = start+step, if rem>0 then stop++, rem--
+    - send start,stop,n to worker
+    - start = stop
+- for i from 0 to stopMaster
+    - make new sol list and add 'i' to it 
+    - call back(sol,n,solutions)
+- for each worker:
+    - recv workerSolutions
+    - add workerSolutions to solutions
+
+
+private static void worker()
+----------------------------
+- recv start,stop,n 
+- set List<List<Integer>> solutions = new ArrayList<>()  (worker solutions)
+- for i from start to stop:
+    - make new sol list and add 'i' to it
+    - call back(sol,n,solutions);
+- send 'solutions' to master
+
+
+public static void back(List<Integer> sol, int n, List<List<Integer>> sols)
+---------------------------------------------------------------------------
+- if sol.size()==n , if checkSol(sol) then sols.add(sol) , return   // for k-perm, check for sol.size()==k; to count return 1 or 0 here
+- for i from 1 to n(inclusive): 
+    - if sol.contains(i) continue
+    - sol.add(i)
+    - call back(sol,n,sols)
+    - sol.remove(sol.size()-1)
+
+
+
+#################################
+Matrix elements sum - Binary tree
+#################################
+
+private static void master(List<List<Integer>> matrix, int numberOfProcesses)
+-----------------------------------------------------------------------------
+- transform matrix in list of elems (matrix.forEach(flatten::addAll))
+- sum = sumRec(flatten, 0, nrProcs)
+- killAll(nrProcs)  i.e. send 0 to each worker
+
+
+private static int sumRec(List<Integer> input, int me, int numberOfProcesses)
+---------------------------------------------------------------------------
+- if 1 elem in input, return that elem
+- child = me + nrProcs/2
+- if nrProcs>=2 && child<nrProcs:
+    - get 1st half of list ( new ArrayList<>(input.subList(0, n/2)) )
+    - send 1 (alive) to child (worker)
+    - send 1st half to worker
+    - get 2nd half of list ( new ArrayList<>(input.subList(n/2, n)) )
+    - sum1 = sumRec(2nd half, me, nrProcs/2)
+    - recv sum of 1st half from worker (sum2)
+  else
+    - sum1 = sumRec(1st half, me, 1)
+    - sum2 = sumRec(2nd half, me, 1)
+- return sum1 + sum2 
+
+
+private static void worker(int me, int numberOfProcesses)
+---------------------------------------------------------
+- everything in a while(true) loop
+- recv alive, if alive is 0, break
+- recv list with Status status=MPI.COMM_WORLD.Recv(list, ...)
+- parent = status.source
+- sum = sumRec(list, me, nrProcs)
+- send sum to parent ( .Send(new Object[]{sum}, 0, 1, MPI.OBJECT, parent, 0) )
+
+
+
+##################################
+K coloring - threaded backtracking - graph is matrix of booleans, n nodes, k colors, T tasks
+##################################
+
+public void backtracking(List<Integer> temp, int T, int k, int n, boolean[][] graph)
+------------------------------------------------------------------------------------
+- if globalSolved then return
+- if temp.size()==n (no. of objects) then
+    - lock.lock()
+    - if !globalSolved then: for i from 0 to n: add temp[i] to globalColors
+    -       - || -           globalSolved=true, executorService.shutdown()
+    - lock.unlock(), return
+- if T==1 then
+    - for each color (1 to k inclusive):
+        if isValidColor(temp.size(),color,graph,temp) then:  //checks if any neighbor has the color
+            - temp.add(color)
+            - backtracking(temp, T, k, n, graph)
+            - temp.remove(temp.size()-1)
+- else:
+    - deepcopy temp in localVar x
+    - executorService.submit(function(x) -> 
+                                for color from 1 to k, step=2: 
+                                    if isValidColor(x.size(),color,graph,x) then:
+                                        - x.add(color)
+                                        - backtracking(x, T/2, k, n, graph)
+                                        - x.remove(x.size()-1)
+                            )
+    - for color from 2 to k, step=2:
+        if isValidColor(temp.size(),color,graph,temp) then:
+                    - temp.add(color)
+                    - backtracking(temp, T-T/2, k, n, graph)
+                    - temp.remove(temp.size()-1)
+
+
+public boolean isValidColor(int node, int color, boolean[][] graph, List<Integer> currentColors)
+-------------------------------------------------------------------------------------------------
+
+
+
+######################################################
+Matrix Product - MPI - split result matrix for workers
+######################################################
+
+void master(int nrProcs, List<List<Integer>> a, List<List<Integer>> b)
+----------------------------------------------------------------------
+- n=a.size(), m=b.get(0).size()
+- List<Integer> masterCells = getCellsById(0, n, m, nrProcs)
+- solution = createEmtpyMatrix(n,m)                         //for(int i=0;i<n;++i) matrix.add(IntStream.range(0,m).map(value->0).boxed().collect(Collectors.toList()))
+- for each worker:
+    - childCells = getCellsById(i,n,m,nrProcs)
+    - send a,b,childCells
+- masterPart = work(n, m, a, b, masterCells)
+- unitePartialSolution(solution, masterPart)
+- for each worker: 
+    - recv workerPart   (cast it as well)
+    - unitePartialSolution(solution, workerPart)
+
+
+void worker(int myId, int nrProcs)
+----------------------------------
+- recv a,b,childCells
+- workerPart = work(n,m,a,b,childCells)
+- send workerPart to 0 (parent)
+
+
+List<Integer> getCellsById(int id, int n, int m, int nrProcs)
+-------------------------------------------------------------
+- step=(n*m)/nrProcs , rem=(n*m)%nrProcs
+- start=id*step , stop=(id+1)*step
+- for i from start to stop: cells.add(i)
+- if id < rem: cells.add((n*m)- rem + id)
+- return cells
+
+
+List<List<Integer>> work(int n, int m, List<List<Integer>> a, List<List<Integer>> b, List<Integer> idxs)
+---------------------------------------------------------------------------------------------------------
+- createEmtpyMatrix(n,m)
+- for each idx:
+    - getCellFromIndex(idx,m) => i=idx/m, j=idx%m
+    - matrix[i][j] = computeSingleElement(a,b,i,j)
+- return matrix
+
+
+Integer computeSingleElement(List<List<Integer>> a, List<List<Integer>> b, int i, int j)
+----------------------------------------------------------------------------------------
+- sum = 0
+- for k from 0 to b.size(): sum += a[i][k] * b[k][j]
+- return sum
+
+
+
+####################################################
+Matrix Power - MPI - split result matrix for workers - k power
+####################################################
+
+private static void master(int nrProcs, List<List<Integer>> a, int k)
+---------------------------------------------------------------------
+- n=a.size() , m=a.get(0).size()
+- List<Integer> masterCells = getCellsById(0, n, m, nrProcs)
+- solution = createEmtpyMatrix(n,m)
+- unitePartialSolution(solution, a)
+- while(k>1)
+    - for each worker:
+        - childCells = getCellsById(i,n,m,nrProcs)
+        - send 1, solution, a, childCells
+    - masterPart = work(n, m, solution, a, masterCells)    // deepcopy(a)
+    - solution = createEmtpyMatrix(n,m)
+    - unitePartialSolution(solution, masterPart)
+    - for each worker:
+        - recv workerPart
+        - unitePartialSolution(solution, workerPart)
+    - k--
+
+
+private static void worker(int myId, int nrProcesses)
+-----------------------------------------------------
+- everything in a while(true) loop
+- recv alive, if alive is 0, break
+- recv matrices a,b and cells
+- workerPart = work(n,m,a,b,cells)
+- send workerPart
+
+
+
+######################################
+KCombinations - split the 1 to n range
+######################################
+
+private static void master(int n, int k, int nrProcs)
+-----------------------------------------------------
+- step = n/nrProcs , rem = n%nrProcs
+- stopMaster = step , if rem>0 then stopMaster++, rem--
+- start = stopMaster
+- set List<List<Integer>> solutions = new ArrayList<>()
+- for each worker:
+    - stop = start+step, if rem>0 then stop++, rem--
+    - send start,stop,n,k to worker
+    - start = stop
+- for i from 0 to stopMaster
+    - make new sol list and add 'i' to it 
+    - call back(sol,n,k,solutions)
+- for each worker:
+    - recv workerSolutions
+    - add workerSolutions to solutions
+
+
+private static void worker()
+----------------------------
+- recv start,stop,n,k 
+- set List<List<Integer>> solutions = new ArrayList<>()  (worker solutions)
+- for i from start to stop:
+    - make new sol list and add 'i' to it
+    - call back(sol,n,k,solutions);
+- send 'solutions' to master
+
+
+public static void back(List<Integer> sol, int n, int k, List<List<Integer>> sols)
+---------------------------------------------------------------------------
+- if sol.size()==k , if checkSol(sol) then sols.add(sol) , return   // to count return 1 or 0 here
+- last=0 , if sol.size()>0 then last=sol.get(sol.size()-1)
+- for i from last+1 to n(inclusive): 
+    - if sol.contains(i) continue
+    - sol.add(i)
+    - call back(sol,n,k,sols)
+    - sol.remove(sol.size()-1)
+
+
+
+########################
+BigNumProduct - threaded
+########################
+
+public List<Integer> multiply(List<Integer> a, List<Integer> b, int T)
+----------------------------------------------------------------------
+- c=new ArrayList<>(), n=a.size(), m=2*n-1, add m 0's to c 
+- step=m/T, rem=m%T, start=0, make new List<Thread> threads
+- for k from 0 to T:
+    - stop=start+step, if rem>0: stop++,rem-- , if stop>m: stop=m
+    - save start,stop to local scope
+    - Thread th = new Thread(()->
+                - for x from start to stop: for i from 0 to n:
+                        if x-i>=n || x-i<0 then continue
+                        c[x] += a[i] * b[x-i] )
+    - threads.add(th) , start=stop
+- for t in threads: t.start()
+- for t in threads: t.join()
+- create result int list , carry=0
+- for i from c.size()-1 to 0:
+    - c[i]+=carry , result.add(c[i]%10)
+    - if c[i]>9 then: carry=c[i]/10 else carry=0
+- while carry>0: result.add(carry%10) , carry/=10
+- Collections.reverse(result), return result
+
+
+
+#########################################
+ScalarProduct - MPI - split result vector
+#########################################
+
+public static void master(List<Integer> a, List<Integer> b, int nrProcs)
+------------------------------------------------------------------------
+- n=a.size(), step=n/nrProcs, rem=n%nrProcs, stopMaster=step
+- if rem>0 then: stopMaster++, rem--
+- start=stopMaster
+- init result list with n 0s
+- for each worker:
+    - stop=start+step
+    - if rem>0 then: stop++, rem--
+    - send start,stop,a,b to worker i
+    - start=stop
+- for i from 0 to stopMaster: result[i]=a[i]*b[i]
+- for each worker:
+    - recv start,stop,workerResult
+    - for k from start to stop: result[k]=workerResult[k]
+- scalarProd = sum of elems from result list
+
+
+public static void worker(int id, int nrProcs)
+----------------------------------------------
+- recv start,stop,a,b
+- make result list, init with 0s
+- for i from start to stop: result[i]=a[i]*b[i]
+- send start,stop,result to 0
+
+
+
+################
+Matrix sum - MPI
+################
+
+public List<List<Integer>> master(List<List<Integer>> a, List<List<Integer>> b, int nrProcs)
+--------------------------------------------------------------------------------------------
+- result = initEmtpyMatrix(rows,cols)
+- for each worker:
+    - elemsToCompute = getElemsById(i,rows,cols,nrProcs)
+    - send elemsToCompute,a,b                           // worker calls work
+- masterElems=getElemsById(0,rows,cols,nrProcs)
+- masterWork = work(rows,cols,a,b,masterElems)
+- mergeSolutionsSoFar(result,masterWork)
+- for each worker:
+    - recv workerResult
+    - mergeSolutionsSoFar(result, workerResult)
+
+
+public List<Integer> getElementsById(int id, int rows, int cols, int nrProcs)
+-------------------------------------------------------------------------------
+- step=(rows*cols)/nrProcs, rem=(rows*cols)%nrProcs
+- begin=id*step , end=(id+1)*step
+- from begin to end: add i to elems
+- if id<rem: elems.add((rows*cols)-rem+id)
+- return elems
+
+public List<List<Integer>> work(int rows, int cols, List<List<Integer>> a, List<List<Integer>> b, List<Integer> idxs)
+---------------------------------------------------------------------------------------------------------------------
+- for each idx: get (i=idx/cols,j=idx%cols), then workMatrix[i][j]=a[i][j]+b[i][j]
+- return workMatrix
+
+
+#########################
+Vectors convolution - MPI
+#########################
+
+public static void master(List<Integer> a, List<Integer> b, int nrProcs)
+------------------------------------------------------------------------
+- n=a.size(), step=n/nrProcs, rem=n%nrProcs, stopMaster=step
+- if rem>0: stopMaster++, rem--
+- start=stopMaster
+- init result list with n 0s
+- for each worker:
+    - stop=start+step, if rem>0: stop++,rem--
+    - send start,stop,a,b            (worker also checks stop)
+    - start=stop
+- for i from 0 to stopMaster: for j from 0 to n:
+    - result[i] += a[j] * b[(k-j)%n]
+- for each worker:
+    - recv workerResult
+    - for j from 0 to n: result[j] += workerResult[j]
